@@ -27,14 +27,22 @@ Component Inputs:
     include_A - bool, default: True
     include_B - bool, default: True
     intermediate_sections - int, default: 3 (number of interpolated sections between each primary control point)
-    transition_bias - float (0.0-1.0), default: 0.5
+    transition_bias_fore - float (0.0-1.0), default: 0.5 (controls transition rate from entry to A/B)
+    transition_bias_aft - float (0.0-1.0), default: 0.5 (controls transition rate from B/A to exit)
     rebuild_tolerance - float
+    norm_length - float, length of normal lines for visualization
+    cilia_curvature_magnitude - float (0.0-1.0), default: 0.0 (0.0 = straight lines, 1.0 = maximum curvature)
+    cilia_exaggeration - float (0.0-5.0), default: 1.0 (multiplier for curvature exaggeration, higher = more pronounced curves)
 
 Component Outputs:
     belt_surface - NURBS surface from Sweep 2 Rails
     warnings - List of warning strings
     debug_curves - List of cross-section bezier curves
     debug_vectors - List of vectors for visualization
+    norm_lines_dome - List of cilia curves (or lines if curvature=0) from dome surface at vector points
+    norm_lines_bowl - List of cilia curves (or lines if curvature=0) from bowl surface at vector points
+    norm_lines_belt_dome - List of cilia curves (or lines if curvature=0) from belt surface at dome-side points
+    norm_lines_belt_bowl - List of cilia curves (or lines if curvature=0) from belt surface at bowl-side points
 """
 
 import Rhino.Geometry as rg
@@ -299,6 +307,129 @@ def create_cubic_bezier(P0, P1, P2, P3):
     return nurbs_curve
 
 
+def create_quadratic_bezier(P0, P1, P2):
+    """
+    Create a quadratic Bezier curve from 3 control points.
+    """
+    bezier = rg.BezierCurve([P0, P1, P2])
+    nurbs_curve = bezier.ToNurbsCurve()
+    return nurbs_curve
+
+
+def create_cilia_curve(surface_point, surface_normal, inboard_tangent, 
+                       surface, surface_u, surface_v, length, curvature_magnitude, 
+                       exaggeration=1.0):
+    """
+    Create a cilia curve as an ARC OF A CIRCLE in the plane spanned by:
+      - inboard tangent direction (90° to trim edge, tangent to the surface, pointing inboard)
+      - surface normal direction at that location
+
+    The arc starts at the trim edge point and is tangent to the surface normal at that point.
+    The circle center lies inboard along the inboard tangent direction.
+    
+    Args:
+        surface_point: Point on the surface edge
+        surface_normal: Normal vector at the surface point
+        inboard_tangent: Tangent-to-surface direction, perpendicular to trim edge, pointing inboard
+        surface: Surface (NurbsSurface) for curvature evaluation
+        surface_u, surface_v: UV parameters on surface
+        length: Length of the cilia curve
+        curvature_magnitude: 0.0-1.0, controls curvature amount
+        exaggeration: Multiplier for curvature exaggeration (0.0-5.0, default 1.0)
+    
+    Returns:
+        NURBS curve representing the cilia, or None if creation fails
+    """
+    if curvature_magnitude <= 0.0:
+        # Straight line: return as simple line curve
+        end_point = surface_point + surface_normal * length
+        line = rg.Line(surface_point, end_point)
+        return line.ToNurbsCurve()
+
+    # Normalize directions
+    n = rg.Vector3d(surface_normal)
+    n.Unitize()
+    t_in = rg.Vector3d(inboard_tangent)
+    if not t_in.Unitize():
+        # Fallback to straight line if we can't determine inboard tangent
+        end_point = surface_point + n * length
+        return rg.Line(surface_point, end_point).ToNurbsCurve()
+
+    # --- Surface normal curvature in the inboard direction ---
+    # k_n(d) = k1*(d·e1)^2 + k2*(d·e2)^2  (Euler)
+    curvature_inboard = 0.0  # 1/length
+    try:
+        # RhinoCommon Surface curvature API:
+        # - Most reliably: surface.CurvatureAt(u,v) -> SurfaceCurvature
+        #   which provides Kappa(0/1) and Direction(0/1).
+        scurv = None
+        try:
+            scurv = surface.CurvatureAt(surface_u, surface_v)
+        except:
+            scurv = None
+
+        # Fallback: some surface types may expose PrincipalCurvatureAt
+        if scurv is None:
+            try:
+                scurv = surface.PrincipalCurvatureAt(surface_u, surface_v)
+            except:
+                scurv = None
+
+        if scurv:
+            k1 = scurv.Kappa(0)
+            k2 = scurv.Kappa(1)
+            e1 = scurv.Direction(0)
+            e2 = scurv.Direction(1)
+            e1.Unitize()
+            e2.Unitize()
+
+            d = rg.Vector3d(t_in)
+            d.Unitize()
+
+            c1 = rg.Vector3d.Multiply(d, e1)
+            c2 = rg.Vector3d.Multiply(d, e2)
+            k_n = (k1 * (c1 ** 2)) + (k2 * (c2 ** 2))
+            curvature_inboard = abs(k_n)
+    except:
+        curvature_inboard = 0.0
+
+    exaggeration_clamped = max(0.0, min(5.0, exaggeration))
+    k_eff = curvature_inboard * curvature_magnitude * max(1e-9, exaggeration_clamped)
+
+    # If curvature is tiny, return a straight normal line
+    if k_eff < 1e-9:
+        end_point = surface_point + n * length
+        return rg.Line(surface_point, end_point).ToNurbsCurve()
+
+    # Radius from curvature
+    R = 1.0 / k_eff
+    if R < 1e-6:
+        R = 1e-6
+
+    # Cap radius so circles remain visible (huge radii look like straight lines).
+    # This keeps the visualization useful while still responding to curvature.
+    max_R = max(10.0 * length, 1.0)
+    if R > max_R:
+        R = max_R
+
+    # Circle center inboard, point on circle at trim point is exactly one radius away
+    C = rg.Point3d(surface_point + t_in * R)
+
+    # Build the FULL circle first (as requested). This makes the curvature visually obvious.
+    # Circle plane is spanned by (inboard_tangent, surface_normal) and centered at C.
+    try:
+        plane = rg.Plane(C, t_in, n)
+        circle = rg.Circle(plane, R)
+        if circle.IsValid:
+            return circle.ToNurbsCurve()
+    except:
+        pass
+
+    # Fallback to straight line if circle construction fails
+    end_point = surface_point + n * length
+    return rg.Line(surface_point, end_point).ToNurbsCurve()
+
+
 def interpolate_value(val_start, val_end, t, bias=0.5):
     """
     Interpolate between two values with bias curve.
@@ -380,19 +511,21 @@ def build_primary_control_points(exit_param, A_position, B_position, include_A, 
     ))
 
     # Mirror points (second half: exit_param to 1.0)
-    # Mirrors should maintain same relative position from exit as originals from entry
+    # IMPORTANT: For symmetry across the YZ plane, the mirrored order must be reversed.
+    # If A is at 0.33 and B is at 0.66 in the first half (entry->exit),
+    # then in the second half (exit->entry) we want:
+    #   exit -> B_mirror -> A_mirror -> entry
+    # So we use (1 - position) when mapping into the second half.
     if include_B:
-        # B_mirror at same relative position in second half as B in first half
-        # If B is at 0.66 of first half, B_mirror is at 0.66 of second half
-        B_mirror_param = exit_param + (1.0 - exit_param) * B_position
+        # If B is at 0.66 of first half, B_mirror should be at 0.34 of the second half (closer to exit)
+        B_mirror_param = exit_param + (1.0 - exit_param) * (1.0 - B_position)
         control_points.append(ControlPointDefinition(
             "B_mirror", B_mirror_param, B_angle_dome, B_angle_bowl, B_mag_dome, B_mag_bowl
         ))
 
     if include_A:
-        # A_mirror at same relative position in second half as A in first half
-        # If A is at 0.33 of first half, A_mirror is at 0.33 of second half
-        A_mirror_param = exit_param + (1.0 - exit_param) * A_position
+        # If A is at 0.33 of first half, A_mirror should be at 0.67 of the second half (further from exit)
+        A_mirror_param = exit_param + (1.0 - exit_param) * (1.0 - A_position)
         control_points.append(ControlPointDefinition(
             "A_mirror", A_mirror_param, A_angle_dome, A_angle_bowl, A_mag_dome, A_mag_bowl
         ))
@@ -403,11 +536,18 @@ def build_primary_control_points(exit_param, A_position, B_position, include_A, 
     return control_points
 
 
-def build_intermediate_control_points(cp1, cp2, num_intermediates, bias):
+def build_intermediate_control_points(cp1, cp2, num_intermediates, bias, reverse_direction=False):
     """
     Build intermediate control points between two primary control points.
     Interpolates angles and magnitudes using bias curve.
     Handles wrap-around when going from last point (near 1.0) back to first (0.0).
+
+    Args:
+        cp1: Source control point
+        cp2: Target control point
+        num_intermediates: Number of intermediate points to create
+        bias: Bias value for interpolation (0.0-1.0)
+        reverse_direction: If True, reverse interpolation direction (swap start/end)
 
     Returns list of ControlPointDefinition objects (does NOT include cp1 or cp2).
     """
@@ -445,10 +585,21 @@ def build_intermediate_control_points(cp1, cp2, num_intermediates, bias):
             param = cp1.param + (cp2.param - cp1.param) * t
 
         # Interpolate angles and magnitudes with bias
-        angle_dome = interpolate_value(cp1.angle_dome, cp2.angle_dome, t, bias)
-        angle_bowl = interpolate_value(cp1.angle_bowl, cp2.angle_bowl, t, bias)
-        mag_dome = interpolate_value(cp1.mag_dome, cp2.mag_dome, t, bias)
-        mag_bowl = interpolate_value(cp1.mag_bowl, cp2.mag_bowl, t, bias)
+        # If reverse_direction is True, invert the bias (1.0 - bias) to create symmetry
+        # This mirrors the bias curve shape while maintaining forward interpolation direction
+        if reverse_direction:
+            # For symmetry: invert bias value to mirror the curve shape
+            inverted_bias = 1.0 - bias
+            angle_dome = interpolate_value(cp1.angle_dome, cp2.angle_dome, t, inverted_bias)
+            angle_bowl = interpolate_value(cp1.angle_bowl, cp2.angle_bowl, t, inverted_bias)
+            mag_dome = interpolate_value(cp1.mag_dome, cp2.mag_dome, t, inverted_bias)
+            mag_bowl = interpolate_value(cp1.mag_bowl, cp2.mag_bowl, t, inverted_bias)
+        else:
+            # Normal: interpolate from source toward target with original bias
+            angle_dome = interpolate_value(cp1.angle_dome, cp2.angle_dome, t, bias)
+            angle_bowl = interpolate_value(cp1.angle_bowl, cp2.angle_bowl, t, bias)
+            mag_dome = interpolate_value(cp1.mag_dome, cp2.mag_dome, t, bias)
+            mag_bowl = interpolate_value(cp1.mag_bowl, cp2.mag_bowl, t, bias)
 
         # Create intermediate control point
         name = f"{cp1.name}_to_{cp2.name}_{i}"
@@ -459,9 +610,17 @@ def build_intermediate_control_points(cp1, cp2, num_intermediates, bias):
     return intermediates
 
 
-def build_all_control_points(primary_cps, num_intermediates, bias):
+def build_all_control_points(primary_cps, num_intermediates, transition_bias_fore, transition_bias_aft, warnings=None):
     """
     Build complete list of control points including intermediates.
+    Uses symmetric transition bias: fore bias for entry side, aft bias for exit side.
+    Far side (after exit) uses reversed interpolation direction for symmetry.
+
+    Args:
+        primary_cps: List of primary control points (entry, A, B, exit, mirrors)
+        num_intermediates: Number of intermediate points between each primary pair
+        transition_bias_fore: Bias for transitions from entry to A/B (0.0-1.0)
+        transition_bias_aft: Bias for transitions from B/A to exit (0.0-1.0)
 
     Returns sorted list of all ControlPointDefinition objects.
     Ensures closure by adding a duplicate entry point at param = 1.0 if needed.
@@ -471,12 +630,33 @@ def build_all_control_points(primary_cps, num_intermediates, bias):
     # Add all primary control points
     all_cps.extend(primary_cps)
 
+    # Identify exit parameter (defines fore vs aft halves)
+    exit_cp = None
+    for cp in primary_cps:
+        if cp.name == "exit":
+            exit_cp = cp
+            break
+
+    exit_param = exit_cp.param if exit_cp else 0.5
+    tol = 1e-6
+
     # Add intermediates between each consecutive pair
     for i in range(len(primary_cps)):
         cp1 = primary_cps[i]
         cp2 = primary_cps[(i + 1) % len(primary_cps)]  # Wrap around to close the loop
 
-        intermediates = build_intermediate_control_points(cp1, cp2, num_intermediates, bias)
+        # Determine which bias to use and whether to invert bias for symmetry.
+        # IMPORTANT: This must be robust to A/B ordering and missing points.
+        bias, reverse_direction, bias_label = determine_bias_and_direction(
+            cp1, cp2, transition_bias_fore, transition_bias_aft, exit_param, tol
+        )
+
+        if warnings is not None:
+            warnings.append(
+                f"DEBUG: Bias segment {cp1.name}->{cp2.name}: {bias_label}, bias={bias:.3f}, invert={reverse_direction}"
+            )
+
+        intermediates = build_intermediate_control_points(cp1, cp2, num_intermediates, bias, reverse_direction)
         all_cps.extend(intermediates)
 
     # Sort by param
@@ -510,6 +690,55 @@ def build_all_control_points(primary_cps, num_intermediates, bias):
     return all_cps
 
 
+def determine_bias_and_direction(cp1, cp2, transition_bias_fore, transition_bias_aft, exit_param, tol=1e-6):
+    """
+    Determine which bias value and direction to use for interpolation between two control points.
+    
+    Args:
+        cp1: Source control point
+        cp2: Target control point
+        transition_bias_fore: Bias for fore side transitions
+        transition_bias_aft: Bias for aft side transitions
+    
+    Returns:
+        Tuple of (bias_value, reverse_direction)
+    """
+    name1 = cp1.name
+    name2 = cp2.name
+
+    # Robust, param-driven segmentation:
+    # Fore half is entry(0) -> exit(exit_param)
+    # Aft half is exit(exit_param) -> entry(0) (wrap)
+    # Bias rules (regardless of A/B ordering):
+    # - entry -> first interior: fore bias (no invert)
+    # - interior -> interior: linear (0.5)
+    # - last interior -> exit: aft bias (no invert)
+    # - exit -> first mirror: aft bias (invert for symmetry)
+    # - mirror -> mirror: linear (0.5) (invert doesn't matter)
+    # - last mirror -> entry (wrap): fore bias (invert for symmetry)
+
+    # Segment endpoints override:
+    if name1 == "entry":
+        # entry -> anything on fore half
+        return (transition_bias_fore, False, "fore(entry_to_first_or_exit)")
+
+    if name2 == "exit":
+        # last fore interior -> exit
+        return (transition_bias_aft, False, "aft(last_to_exit)")
+
+    if name1 == "exit":
+        # exit -> first mirror
+        return (transition_bias_aft, True, "aft(exit_to_first_mirror_inverted)")
+
+    if name2 == "entry":
+        # last mirror -> entry (wrap)
+        return (transition_bias_fore, True, "fore(last_mirror_to_entry_inverted)")
+
+    # Interior-to-interior segments are linear, both on fore or aft side.
+    # This covers A<->B (either order) and B_mirror<->A_mirror (either order).
+    return (0.5, False, "linear")
+
+
 # ============================================================================
 # MAIN ALGORITHM
 # ============================================================================
@@ -526,15 +755,20 @@ def generate_belt_surface(dome, bowl,
                           exit_mag_dome, exit_mag_bowl,
                           include_A, include_B,
                           intermediate_sections,
-                          transition_bias, rebuild_tolerance):
+                          transition_bias_fore, transition_bias_aft, rebuild_tolerance, norm_length, 
+                          cilia_curvature_magnitude, cilia_exaggeration):
     """
     Main belt surface generation algorithm using Sweep 2 Rails.
 
-    Returns: (belt_surface, warnings, debug_curves, debug_vectors)
+    Returns: (belt_surface, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
     """
     warnings = []
     debug_curves = []
     debug_vectors = []
+    norm_lines_dome = []
+    norm_lines_bowl = []
+    norm_lines_belt_dome = []
+    norm_lines_belt_bowl = []
 
     # ========================================================================
     # STEP 1: EXTRACT EDGE CURVES (RAILS)
@@ -545,7 +779,7 @@ def generate_belt_surface(dome, bowl,
 
     if not dome_edge or not bowl_edge:
         warnings.append("ERROR: Could not extract trim curves from surfaces")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     dome_edge_length = dome_edge.GetLength()
     bowl_edge_length = bowl_edge.GetLength()
@@ -563,7 +797,7 @@ def generate_belt_surface(dome, bowl,
 
     if not dome_intersections or not bowl_intersections:
         warnings.append("ERROR: Could not find YZ plane intersections")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     dome_entry_param = dome_intersections['entry']['param']
     bowl_entry_param = bowl_intersections['entry']['param']
@@ -589,7 +823,7 @@ def generate_belt_surface(dome, bowl,
 
     if not dome_intersections_reordered or not bowl_intersections_reordered:
         warnings.append("ERROR: Could not find YZ plane exit intersections after reordering")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     # After reordering, entry should be at param ~0.0, exit at param ~0.5 or wherever it crosses YZ plane
     dome_exit_param = dome_intersections_reordered['exit']['param']
@@ -653,7 +887,7 @@ def generate_belt_surface(dome, bowl,
     # STEP 5: BUILD ALL CONTROL POINTS (PRIMARY + INTERMEDIATES)
     # ========================================================================
 
-    all_cps = build_all_control_points(primary_cps, intermediate_sections, transition_bias)
+    all_cps = build_all_control_points(primary_cps, intermediate_sections, transition_bias_fore, transition_bias_aft, warnings=warnings)
 
     warnings.append(f"DEBUG: Total control points (with intermediates) = {len(all_cps)}")
 
@@ -739,6 +973,47 @@ def generate_belt_surface(dome, bowl,
             # Scale by magnitude, adjusted for local distance
             # Use local distance to ensure magnitude is appropriate for this location
             cp.dome_vector = dome_vector * (cp.mag_dome * distance)
+
+            # Generate cilia curve from dome surface at this point
+            dome_face = dome.Faces[0]
+            success, dome_u, dome_v = dome_face.ClosestPoint(cp.dome_point)
+            if success and norm_length > 0:
+                dome_normal = dome_face.NormalAt(dome_u, dome_v)
+                dome_normal.Unitize()
+                
+                # Ensure normal points away from origin (0,0,0)
+                # Check if normal points toward origin, if so reverse it
+                to_origin = rg.Point3d.Origin - cp.dome_point
+                to_origin.Unitize()
+                if rg.Vector3d.Multiply(dome_normal, to_origin) > 0:
+                    # Normal points toward origin, reverse it
+                    dome_normal.Reverse()
+                
+                # Create cilia curve (circle arc) driven by surface curvature inboard (90° to trim edge)
+                if cilia_curvature_magnitude and cilia_curvature_magnitude > 0:
+                    # Get surface for curvature calculation
+                    dome_surface = dome_face.ToNurbsSurface()
+                    if dome_surface:
+                        # inboard tangent is opposite of the belt/outward perpendicular
+                        inboard_tangent = rg.Vector3d(dome_perpendicular)
+                        inboard_tangent.Reverse()
+                        inboard_tangent.Unitize()
+
+                        cilia_curve = create_cilia_curve(
+                            cp.dome_point, dome_normal, inboard_tangent,
+                            dome_surface, dome_u, dome_v, norm_length,
+                            cilia_curvature_magnitude, exaggeration=cilia_exaggeration
+                        )
+                        if cilia_curve:
+                            norm_lines_dome.append(cilia_curve)
+                    else:
+                        # Fallback to straight line
+                        norm_line_dome = rg.Line(cp.dome_point, cp.dome_point + dome_normal * norm_length)
+                        norm_lines_dome.append(norm_line_dome)
+                else:
+                    # Straight line when curvature is 0
+                    norm_line_dome = rg.Line(cp.dome_point, cp.dome_point + dome_normal * norm_length)
+                    norm_lines_dome.append(norm_line_dome)
         else:
             warnings.append(f"WARNING: Could not calculate dome vector for {cp.name}")
             cp.dome_vector = rg.Vector3d(0, 0, 1) * distance * 0.3
@@ -763,6 +1038,39 @@ def generate_belt_surface(dome, bowl,
             # Scale by magnitude, adjusted for local distance
             # Use local distance to ensure magnitude is appropriate for this location
             cp.bowl_vector = bowl_vector * (cp.mag_bowl * distance)
+
+            # Generate cilia curve from bowl surface at this point
+            bowl_face = bowl.Faces[0]
+            success, bowl_u, bowl_v = bowl_face.ClosestPoint(cp.bowl_point)
+            if success and norm_length > 0:
+                bowl_normal = bowl_face.NormalAt(bowl_u, bowl_v)
+                bowl_normal.Unitize()
+                
+                # Create cilia curve (circle arc) driven by surface curvature inboard (90° to trim edge)
+                if cilia_curvature_magnitude and cilia_curvature_magnitude > 0:
+                    # Get surface for curvature calculation
+                    bowl_surface = bowl_face.ToNurbsSurface()
+                    if bowl_surface:
+                        # inboard tangent is opposite of the belt/outward perpendicular
+                        inboard_tangent = rg.Vector3d(bowl_perpendicular)
+                        inboard_tangent.Reverse()
+                        inboard_tangent.Unitize()
+
+                        cilia_curve = create_cilia_curve(
+                            cp.bowl_point, bowl_normal, inboard_tangent,
+                            bowl_surface, bowl_u, bowl_v, norm_length,
+                            cilia_curvature_magnitude, exaggeration=cilia_exaggeration
+                        )
+                        if cilia_curve:
+                            norm_lines_bowl.append(cilia_curve)
+                    else:
+                        # Fallback to straight line
+                        norm_line_bowl = rg.Line(cp.bowl_point, cp.bowl_point + bowl_normal * norm_length)
+                        norm_lines_bowl.append(norm_line_bowl)
+                else:
+                    # Straight line when curvature is 0
+                    norm_line_bowl = rg.Line(cp.bowl_point, cp.bowl_point + bowl_normal * norm_length)
+                    norm_lines_bowl.append(norm_line_bowl)
         else:
             warnings.append(f"WARNING: Could not calculate bowl vector for {cp.name}")
             cp.bowl_vector = rg.Vector3d(0, 0, -1) * distance * 0.3
@@ -791,7 +1099,7 @@ def generate_belt_surface(dome, bowl,
                 debug_curves.append(bezier)
             else:
                 warnings.append(f"ERROR: Invalid bezier curve at {cp.name}")
-                return (None, warnings, debug_curves, debug_vectors)
+                return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     warnings.append(f"DEBUG: Created {len(cross_sections)} cross-section curves")
 
@@ -837,22 +1145,147 @@ def generate_belt_surface(dome, bowl,
         warnings.append(f"DEBUG: Number of cross-sections used = {len(cross_sections_for_sweep)}")
         warnings.append(f"DEBUG: First section valid = {cross_sections_for_sweep[0].IsValid if cross_sections_for_sweep else 'N/A'}")
         warnings.append(f"DEBUG: Last section valid = {cross_sections_for_sweep[-1].IsValid if cross_sections_for_sweep else 'N/A'}")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     # Extract surface from Brep
     brep = sweep_breps[0]
 
     if not brep or brep.Faces.Count == 0:
         warnings.append("ERROR: Sweep result has no faces")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     belt_surface = brep.Faces[0].ToNurbsSurface()
 
     if not belt_surface:
         warnings.append("ERROR: Failed to extract NURBS surface from sweep")
-        return (None, warnings, debug_curves, debug_vectors)
+        return (None, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
     warnings.append(f"SUCCESS: Surface created, IsValid = {belt_surface.IsValid}")
+
+    # ========================================================================
+    # STEP 8.5: EXTRACT NORMAL LINES FROM BELT SURFACE
+    # ========================================================================
+    # Get normals at the same control point locations on the belt surface
+    # For dome-side points, use the dome rail as reference
+    # For bowl-side points, use the bowl rail as reference
+
+    if norm_length and norm_length > 0:
+        belt_face = brep.Faces[0]
+
+        for cp in all_cps:
+            # Get normal line at dome-side point (belt surface near dome edge)
+            # Find closest point on belt surface to dome control point
+            success, belt_u_dome, belt_v_dome = belt_face.ClosestPoint(cp.dome_point)
+            if success:
+                belt_normal_dome = belt_face.NormalAt(belt_u_dome, belt_v_dome)
+                belt_normal_dome.Unitize()
+                
+                # Ensure normal points away from origin (0,0,0)
+                to_origin = rg.Point3d.Origin - cp.dome_point
+                to_origin.Unitize()
+                if rg.Vector3d.Multiply(belt_normal_dome, to_origin) > 0:
+                    # Normal points toward origin, reverse it
+                    belt_normal_dome.Reverse()
+                
+                # Create cilia curve for belt dome side using inboard direction toward the bowl side
+                if cilia_curvature_magnitude and cilia_curvature_magnitude > 0:
+                    # Get edge parameter for this point (use dome rail as edge reference)
+                    success_edge, belt_edge_param_dome = dome_rail.ClosestPoint(cp.dome_point)
+                    if not success_edge:
+                        dome_t = dome_rail.Domain.ParameterAt(cp.param)
+                        belt_edge_param_dome = dome_t
+
+                    # Build inboard tangent direction on the belt surface:
+                    # perpendicular to edge tangent, aligned toward bowl side (across the belt).
+                    edge_tan = dome_rail.TangentAt(belt_edge_param_dome)
+                    edge_tan.Unitize()
+                    candidate = rg.Vector3d.CrossProduct(belt_normal_dome, edge_tan)
+                    candidate.Unitize()
+
+                    to_bowl = cp.bowl_point - cp.dome_point
+                    # project to_bowl onto belt tangent plane
+                    to_bowl_proj = to_bowl - (rg.Vector3d.Multiply(to_bowl, belt_normal_dome) * belt_normal_dome)
+                    if to_bowl_proj.Length > 1e-9:
+                        to_bowl_proj.Unitize()
+                        if rg.Vector3d.Multiply(candidate, to_bowl_proj) < 0:
+                            candidate.Reverse()
+
+                    cilia_curve = create_cilia_curve(
+                        cp.dome_point, belt_normal_dome, candidate,
+                        belt_surface, belt_u_dome, belt_v_dome, norm_length,
+                        cilia_curvature_magnitude, exaggeration=cilia_exaggeration
+                    )
+                    if cilia_curve:
+                        norm_lines_belt_dome.append(cilia_curve)
+                    else:
+                        # Fallback to straight line
+                        norm_line_belt_dome = rg.Line(cp.dome_point, cp.dome_point + belt_normal_dome * norm_length)
+                        norm_lines_belt_dome.append(norm_line_belt_dome)
+                else:
+                    # Straight line when curvature is 0
+                    norm_line_belt_dome = rg.Line(cp.dome_point, cp.dome_point + belt_normal_dome * norm_length)
+                    norm_lines_belt_dome.append(norm_line_belt_dome)
+            else:
+                warnings.append(f"WARNING: Could not find closest point on belt surface for dome point at {cp.name}")
+
+            # Get normal line at bowl-side point (belt surface near bowl edge)
+            # Find closest point on belt surface to bowl control point
+            success, belt_u_bowl, belt_v_bowl = belt_face.ClosestPoint(cp.bowl_point)
+            if success:
+                belt_normal_bowl = belt_face.NormalAt(belt_u_bowl, belt_v_bowl)
+                belt_normal_bowl.Unitize()
+                
+                # Ensure normal points away from origin (0,0,0)
+                to_origin = rg.Point3d.Origin - cp.bowl_point
+                to_origin.Unitize()
+                if rg.Vector3d.Multiply(belt_normal_bowl, to_origin) > 0:
+                    # Normal points toward origin, reverse it
+                    belt_normal_bowl.Reverse()
+                
+                # Create cilia curve for belt bowl side using inboard direction toward the dome side
+                if cilia_curvature_magnitude and cilia_curvature_magnitude > 0:
+                    # Get edge parameter for this point (use bowl rail as edge reference)
+                    success_edge, belt_edge_param_bowl = bowl_rail.ClosestPoint(cp.bowl_point)
+                    if not success_edge:
+                        bowl_t = bowl_rail.Domain.ParameterAt(cp.param)
+                        belt_edge_param_bowl = bowl_t
+
+                    edge_tan = bowl_rail.TangentAt(belt_edge_param_bowl)
+                    edge_tan.Unitize()
+                    candidate = rg.Vector3d.CrossProduct(belt_normal_bowl, edge_tan)
+                    candidate.Unitize()
+
+                    to_dome = cp.dome_point - cp.bowl_point
+                    to_dome_proj = to_dome - (rg.Vector3d.Multiply(to_dome, belt_normal_bowl) * belt_normal_bowl)
+                    if to_dome_proj.Length > 1e-9:
+                        to_dome_proj.Unitize()
+                        if rg.Vector3d.Multiply(candidate, to_dome_proj) < 0:
+                            candidate.Reverse()
+
+                    cilia_curve = create_cilia_curve(
+                        cp.bowl_point, belt_normal_bowl, candidate,
+                        belt_surface, belt_u_bowl, belt_v_bowl, norm_length,
+                        cilia_curvature_magnitude, exaggeration=cilia_exaggeration
+                    )
+                    if cilia_curve:
+                        norm_lines_belt_bowl.append(cilia_curve)
+                    else:
+                        # Fallback to straight line
+                        norm_line_belt_bowl = rg.Line(cp.bowl_point, cp.bowl_point + belt_normal_bowl * norm_length)
+                        norm_lines_belt_bowl.append(norm_line_belt_bowl)
+                else:
+                    # Straight line when curvature is 0
+                    norm_line_belt_bowl = rg.Line(cp.bowl_point, cp.bowl_point + belt_normal_bowl * norm_length)
+                    norm_lines_belt_bowl.append(norm_line_belt_bowl)
+            else:
+                warnings.append(f"WARNING: Could not find closest point on belt surface for bowl point at {cp.name}")
+
+        warnings.append(f"DEBUG: Generated {len(norm_lines_dome)} dome normal lines")
+        warnings.append(f"DEBUG: Generated {len(norm_lines_bowl)} bowl normal lines")
+        warnings.append(f"DEBUG: Generated {len(norm_lines_belt_dome)} belt-dome normal lines")
+        warnings.append(f"DEBUG: Generated {len(norm_lines_belt_bowl)} belt-bowl normal lines")
+    else:
+        warnings.append(f"DEBUG: Skipping belt normal generation - norm_length = {norm_length}")
 
     # ========================================================================
     # STEP 9: OPTIONAL REBUILD
@@ -876,7 +1309,7 @@ def generate_belt_surface(dome, bowl,
         except:
             warnings.append("WARNING: Surface rebuild failed")
 
-    return (belt_surface, warnings, debug_curves, debug_vectors)
+    return (belt_surface, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl)
 
 
 # ============================================================================
@@ -889,8 +1322,12 @@ if B_position is None: B_position = 0.66
 if include_A is None: include_A = True
 if include_B is None: include_B = True
 if intermediate_sections is None: intermediate_sections = 3
-if transition_bias is None: transition_bias = 0.5
+if transition_bias_fore is None: transition_bias_fore = 0.5
+if transition_bias_aft is None: transition_bias_aft = 0.5
 if rebuild_tolerance is None: rebuild_tolerance = 0.01
+if norm_length is None: norm_length = 10.0
+if cilia_curvature_magnitude is None: cilia_curvature_magnitude = 0.0
+if cilia_exaggeration is None: cilia_exaggeration = 1.0
 
 # Set default angles to 0 if not provided
 if entry_angle_dome is None: entry_angle_dome = 0.0
@@ -914,7 +1351,7 @@ if exit_mag_bowl is None: exit_mag_bowl = 0.5
 
 # Execute main algorithm
 if dome and bowl:
-    belt_surface, warnings, debug_curves, debug_vectors = generate_belt_surface(
+    belt_surface, warnings, debug_curves, debug_vectors, norm_lines_dome, norm_lines_bowl, norm_lines_belt_dome, norm_lines_belt_bowl = generate_belt_surface(
         dome, bowl,
         A_position, B_position,
         entry_angle_dome, entry_angle_bowl,
@@ -927,10 +1364,15 @@ if dome and bowl:
         exit_mag_dome, exit_mag_bowl,
         include_A, include_B,
         intermediate_sections,
-        transition_bias, rebuild_tolerance
+        transition_bias_fore, transition_bias_aft, rebuild_tolerance, norm_length, 
+        cilia_curvature_magnitude, cilia_exaggeration
     )
 else:
     warnings = ["ERROR: dome and bowl surfaces required"]
     belt_surface = None
     debug_curves = []
     debug_vectors = []
+    norm_lines_dome = []
+    norm_lines_bowl = []
+    norm_lines_belt_dome = []
+    norm_lines_belt_bowl = []
